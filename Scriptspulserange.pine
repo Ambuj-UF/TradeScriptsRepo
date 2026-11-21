@@ -1,0 +1,1028 @@
+// Pulse Range
+//@version=6
+indicator("Pulse Range Scan", shorttitle="Pulse Range Custom", overlay=true, dynamic_requests=true)
+
+//=====================================================================
+// CUSTOMIZED FROM ORIGINAL НАСТРОЙКИ SCRIPT
+//=====================================================================
+
+const string calculationGroup = "Calculation"
+const string visualGroup      = "Visuals"
+const string alertsGroup      = "Alerts"
+
+// Расчёт
+
+sourceValue = input.source(
+     close,
+     title="Source",
+     group=calculationGroup
+)
+
+rangeLength = input.int(
+     40,
+     title="Sampling Period",
+     minval=1,
+     group=calculationGroup
+)
+
+rangeScale = input.float(
+     3.4,
+     title="Range Multiplier",
+     minval=0.1,
+     step=0.1,
+     group=calculationGroup
+)
+
+confirmAtClose = input.bool(
+     true,
+     title="Confirm Signal On Bar Close",
+     group=calculationGroup,
+     tooltip="Сигнал подтверждается после закрытия свечи."
+)
+
+// Визуал
+
+displayBands = input.bool(
+     true,
+     title="Show Range Bands",
+     group=visualGroup
+)
+
+displayFill = input.bool(
+     true,
+     title="Show Range Fill",
+     group=visualGroup
+)
+
+repaintCandles = input.bool(
+     true,
+     title="Color Candles",
+     group=visualGroup
+)
+
+displaySignals = input.bool(
+     true,
+     title="Show Signal Triangles",
+     group=visualGroup
+)
+
+signalOffset = input.float(
+     0.85,
+     title="Triangle Distance From Center",
+     minval=0.05,
+     step=0.05,
+     group=visualGroup,
+     tooltip="Расстояние треугольника от центральной линии."
+)
+
+// Уведомления
+
+alertsEnabled = input.bool(
+     true,
+     title="Enable Alert Conditions",
+     group=alertsGroup
+)
+
+//=====================================================================
+// ЦВЕТА
+//=====================================================================
+
+risingColor  = color.rgb(0, 205, 115)
+fallingColor = color.rgb(255, 65, 70)
+flatColor    = color.rgb(120, 130, 145)
+
+//=====================================================================
+// АДАПТИВНЫЙ ДИАПАЗОН
+//=====================================================================
+
+buildRange(
+     series float price,
+     int period,
+     float multiplier
+) =>
+    int smoothPeriod = period * 2 - 1
+
+    float averageChange = ta.ema(
+         math.abs(price - price[1]),
+         period
+    )
+
+    float filteredChange = ta.ema(
+         averageChange,
+         smoothPeriod
+    )
+
+    filteredChange * multiplier
+
+//=====================================================================
+// ЦЕНТРАЛЬНАЯ ЛИНИЯ
+//=====================================================================
+
+buildCenter(
+     series float price,
+     series float rangeValue
+) =>
+    var float centerValue = na
+
+    if na(centerValue[1])
+        centerValue := price
+
+    else if price > centerValue[1]
+        centerValue :=
+             price - rangeValue < centerValue[1] ?
+             centerValue[1] :
+             price - rangeValue
+
+    else
+        centerValue :=
+             price + rangeValue > centerValue[1] ?
+             centerValue[1] :
+             price + rangeValue
+
+    centerValue
+
+//=====================================================================
+// ОСНОВНЫЕ ЗНАЧЕНИЯ
+//=====================================================================
+
+activeRange = buildRange(
+     sourceValue,
+     rangeLength,
+     rangeScale
+)
+
+centerTrack = buildCenter(
+     sourceValue,
+     activeRange
+)
+
+upperTrack = centerTrack + activeRange
+lowerTrack = centerTrack - activeRange
+
+//=====================================================================
+// НАПРАВЛЕНИЕ ЦЕНТРАЛЬНОЙ ЛИНИИ
+//=====================================================================
+
+// 1  = рост
+// -1 = снижение
+// 0  = направление ещё не определено
+
+var int trackDirection = 0
+
+if centerTrack > centerTrack[1]
+    trackDirection := 1
+
+else if centerTrack < centerTrack[1]
+    trackDirection := -1
+
+else
+    trackDirection := nz(trackDirection[1], 0)
+
+//=====================================================================
+// СИГНАЛ ПРИ СМЕНЕ ЦВЕТА
+//=====================================================================
+
+priorDirection = nz(trackDirection[1], 0)
+
+greenTurn =
+     trackDirection == 1 and
+     priorDirection == -1
+
+redTurn =
+     trackDirection == -1 and
+     priorDirection == 1
+
+barConfirmed =
+     not confirmAtClose or
+     barstate.isconfirmed
+
+greenSignal =
+     greenTurn and
+     barConfirmed
+
+redSignal =
+     redTurn and
+     barConfirmed
+
+//=====================================================================
+// ЦВЕТ ЛИНИИ
+//=====================================================================
+
+trackColor =
+     trackDirection == 1 ?
+         risingColor :
+     trackDirection == -1 ?
+         fallingColor :
+         flatColor
+
+//=====================================================================
+// ПОЗИЦИИ ТРЕУГОЛЬНИКОВ
+//=====================================================================
+
+// Зелёный треугольник всегда ниже центральной линии.
+
+greenMarkerPrice =
+     centerTrack -
+     activeRange * signalOffset
+
+// Красный треугольник всегда выше центральной линии.
+
+redMarkerPrice =
+     centerTrack +
+     activeRange * signalOffset
+
+//=====================================================================
+// ЛИНИИ
+//=====================================================================
+
+centerPlot = plot(
+     centerTrack,
+     title="Center Track",
+     color=trackColor,
+     linewidth=4
+)
+
+upperPlot = plot(
+     displayBands ? upperTrack : na,
+     title="Upper Track",
+     color=color.new(risingColor, 20),
+     linewidth=1
+)
+
+lowerPlot = plot(
+     displayBands ? lowerTrack : na,
+     title="Lower Track",
+     color=color.new(fallingColor, 20),
+     linewidth=1
+)
+
+//=====================================================================
+// ЗАЛИВКА
+//=====================================================================
+
+fill(
+     upperPlot,
+     centerPlot,
+     color=
+         displayFill ?
+         color.new(risingColor, 90) :
+         na,
+     title="Upper Fill"
+)
+
+fill(
+     lowerPlot,
+     centerPlot,
+     color=
+         displayFill ?
+         color.new(fallingColor, 90) :
+         na,
+     title="Lower Fill"
+)
+
+//=====================================================================
+// ЦВЕТ СВЕЧЕЙ
+//=====================================================================
+
+activeCandleColor =
+     trackDirection == 1 ?
+         risingColor :
+     trackDirection == -1 ?
+         fallingColor :
+         flatColor
+
+barcolor(
+     repaintCandles ?
+         activeCandleColor :
+         na
+)
+
+//=====================================================================
+// СИГНАЛЬНЫЕ ТРЕУГОЛЬНИКИ
+//=====================================================================
+
+plotshape(
+     displaySignals and greenSignal ?
+         greenMarkerPrice :
+         na,
+     title="Green Signal",
+     style=shape.triangleup,
+     location=location.absolute,
+     color=risingColor,
+     size=size.small
+)
+
+plotshape(
+     displaySignals and redSignal ?
+         redMarkerPrice :
+         na,
+     title="Red Signal",
+     style=shape.triangledown,
+     location=location.absolute,
+     color=fallingColor,
+     size=size.small
+)
+
+//=====================================================================
+// УВЕДОМЛЕНИЯ
+//=====================================================================
+
+alertcondition(
+     alertsEnabled and greenSignal,
+     title="Pulse Range — Green Signal",
+     message="Pulse Range: center line changed from red to green"
+)
+
+alertcondition(
+     alertsEnabled and redSignal,
+     title="Pulse Range — Red Signal",
+     message="Pulse Range: center line changed from green to red"
+)
+
+alertcondition(
+     alertsEnabled and
+     (greenSignal or redSignal),
+     title="Pulse Range — Direction Change",
+     message="Pulse Range: center line changed direction"
+)
+
+
+
+//============================================================================================================
+//============================================================================================================
+// MULTI-TICKER PULSE REVERSAL MONITOR — DYNAMIC LIST
+//============================================================================================================
+//============================================================================================================
+
+const string scanGroup = "Pulse Reversal Monitor"
+
+scanEnabled = input.bool(true, "Enable Monitor", group=scanGroup)
+scanTF = input.timeframe("", "Scanner Timeframe", group=scanGroup)
+scanBars = input.int(3, "Recent Completed Candles", minval=1, maxval=100, group=scanGroup)
+scanFont = input.string("Small", "Font Size", options=["Tiny", "Small", "Normal", "Large"], group=scanGroup)
+maxSymbols = input.int(40, "Maximum Symbols", minval=1, maxval=64, group=scanGroup)
+
+//============================================================================================================
+// Change the list below to scan various other tickers, as tradingview has 40 ticker restriction at once.
+// Manually add EXCHANGE:TICKER and separate symbols with commas in settings window to scan ther tickers of interest. 
+//============================================================================================================
+
+
+//=====================================================================
+// LIST 1 — SNP500 Top 40 picks
+// 40 tickers
+//=====================================================================
+
+tickerList = input.text_area(
+    "NASDAQ:AAPL,NASDAQ:NVDA,NASDAQ:MSFT,NASDAQ:AMZN,NASDAQ:GOOGL,NASDAQ:AVGO,NASDAQ:META,NASDAQ:GOOG,NYSE:LLY,NASDAQ:TSLA,NYSE:BRK.B,NYSE:JPM,NASDAQ:AMD,NASDAQ:MU,NYSE:V,NYSE:XOM,NYSE:JNJ,NASDAQ:WMT,NYSE:MA,NYSE:ABBV,NASDAQ:COST,NYSE:CVX,NYSE:PG,NASDAQ:CSCO,NYSE:KO,NASDAQ:PLTR,NYSE:HD,NYSE:GE,NYSE:MRK,NYSE:BAC,NYSE:UNH,NASDAQ:PANW,NYSE:PM,NASDAQ:INTC,NASDAQ:AMAT,NYSE:RTX,NASDAQ:TXN,NASDAQ:LRCX,NYSE:TMO,NASDAQ:CRWD",
+    title="Ticker List (comma separated)",
+    group=scanGroup)
+
+
+//=====================================================================
+// LIST 2 — LARGE CAPS: FINANCIALS, TECH, HEALTHCARE
+// 40 tickers
+//=====================================================================
+
+// tickerList = input.text_area(
+//     "NYSE:GS,NYSE:CAT,NASDAQ:NFLX,NYSE:WFC,NASDAQ:AMGN,NASDAQ:LIN,NYSE:ORCL,NYSE:IBM,NYSE:MS,NYSE:DIS,NASDAQ:GILD,NYSE:GEV,NYSE:ANET,NYSE:C,NYSE:MCD,NASDAQ:PEP,NYSE:VZ,NYSE:APH,NASDAQ:KLAC,NASDAQ:ADI,NYSE:ABT,NYSE:WELL,NASDAQ:QCOM,NYSE:NEE,NYSE:UNP,NYSE:BLK,NYSE:AXP,NYSE:COP,NYSE:DE,NYSE:PFE,NYSE:TJX,NYSE:CRM,NYSE:SCHW,NYSE:T, NASDAQ:ISRG,NYSE:DHR,NYSE:UBER,NYSE:ACN,NYSE:SPGI,NASDAQ:VRTX",
+//     title="Ticker List (comma separated)",
+//     group=scanGroup)
+
+
+//=====================================================================
+// LIST 3 — LARGE CAPS: INDUSTRIALS, ENERGY, GROWTH
+// 40 tickers
+//=====================================================================
+
+// tickerList = input.text_area(
+//     "NYSE:PGR,NYSE:ETN,NYSE:CB,NYSE:BA,NASDAQ:MRVL,NYSE:LOW,NYSE:MO,NYSE:MCK,NYSE:MDT,NASDAQ:SBUX,NASDAQ:STX,NASDAQ:ADP,NYSE:BMY,NYSE:PLD,NYSE:LMT,NYSE:PH,NASDAQ:BKNG,NYSE:COF,NASDAQ:CME,NYSE:SYK,NYSE:NEM,NYSE:SO,NASDAQ:WDC,NASDAQ:APP,NYSE:MPC,NYSE:CVS,NASDAQ:EQIX,NYSE:DUK,NYSE:BNY,NYSE:VLO,NYSE:MRSH,NYSE:PSX,NYSE:DELL,NYSE:ICE,NASDAQ:CSX,NYSE:NOW,NYSE:MMM,NASDAQ:REGN,NYSE:PWR,NYSE:USB",
+//     title="Ticker List (comma separated)",
+//     group=scanGroup)
+
+
+//=====================================================================
+// LIST 4 — LARGE CAPS: SOFTWARE, INFRASTRUCTURE, CONSUMER
+// 40 tickers
+//=====================================================================
+
+// tickerList = input.text_area(
+//     "NASDAQ:ADBE,NASDAQ:MAR,NYSE:TT,NYSE:EMR,NYSE:GD,NYSE:WM,NYSE:BX,NYSE:HWM,NASDAQ:CMCSA,NYSE:PNC,NYSE:MSI,NASDAQ:CDNS,NYSE:GLW,NASDAQ:INTU,NYSE:AMT,NASDAQ:CEG,NYSE:ELV,NASDAQ:SNPS,NASDAQ:MDLZ,NYSE:JCI,NASDAQ:FTNT,NYSE:UPS,NYSE:WMB,NYSE:HLT,NYSE:TRV,NASDAQ:TMUS,NYSE:EOG,NYSE:SHW,NYSE:CL,NYSE:RCL,NYSE:TGT,NASDAQ:ORLY,NASDAQ:CTAS,NYSE:ECL,NASDAQ:ABNB,NYSE:SPG,NYSE:NOC,NYSE:VRT,NYSE:FCX,NYSE:HST",
+//     title="Ticker List (comma separated)",
+//     group=scanGroup)
+
+
+//=====================================================================
+// LIST 5 — LARGE CAPS: DIVERSIFIED S&P 500
+// 40 tickers
+//=====================================================================
+
+// tickerList = input.text_area(
+//     "NYSE:ITW,NYSE:SLB,NASDAQ:ROST,NYSE:CI,NYSE:GM,NYSE:NSC,NYSE:AJG,NYSE:MCO,NYSE:AON,NYSE:FDX,NASDAQ:HON,NYSE:APD,NYSE:HCA,NASDAQ:AEP,NYSE:ALL,NYSE:URI,NYSE:COR,NASDAQ:MPWR,NYSE:KMB,NYSE:KKR,NASDAQ:NXPI,NYSE:TDG,NYSE:CAH,NASDAQ:MNST,NYSE:BSX,NYSE:DLR,NYSE:KMI,NYSE:GWW,NYSE:TEL,NYSE:HPE,NYSE:TRGP,NASDAQ:DASH,NYSE:CRH,NASDAQ:FAST,NYSE:EW,NYSE:D,NYSE:CMI,NYSE:BDX,NASDAQ:DDOG,NYSE:OXY",
+//     title="Ticker List (comma separated)",
+//     group=scanGroup)
+
+
+//=====================================================================
+// LIST 6 — SPECULATIVE GROWTH / HIGH-INTEREST STOCKS
+// 40 tickers — mixed market capitalizations
+//=====================================================================
+
+// tickerList = input.text_area(
+//     "NASDAQ:RKLB,NASDAQ:ASTS,NYSE:IONQ,NASDAQ:RGTI,NASDAQ:QUBT,NYSE:QBTS,NYSE:OKLO,NYSE:SMR,NYSE:LEU,NYSE:UEC,NASDAQ:AEVA,NYSE:KULR,NASDAQ:APLD,NASDAQ:IREN,NASDAQ:CIFR,NASDAQ:WULF,NASDAQ:HUT,NASDAQ:HIVE,NASDAQ:NBIS,NASDAQ:CRWV,NASDAQ:SOFI,NASDAQ:UPST,NASDAQ:RZLV,NASDAQ:RXRX,NASDAQ:CRSP,NASDAQ:BEAM,NASDAQ:NTLA,NASDAQ:SMMT,NASDAQ:VKTX,NASDAQ:CYTK,NASDAQ:IOVA,NASDAQ:ARWR,NASDAQ:BCRX,NASDAQ:RCKT,NASDAQ:SLS,NASDAQ:INO,NASDAQ:MIST,NASDAQ:LUNR,NYSE:RDW,NYSE:BKSY",
+//     title="Ticker List (comma separated)",
+//     group=scanGroup)
+
+
+
+
+
+//=====================================================================
+// PULSE RANGE SIGNAL CALCULATION
+//=====================================================================
+
+
+
+
+pulseScan() =>
+    float r = buildRange(close, rangeLength, rangeScale)
+    float c = buildCenter(close, r)
+
+    var int direction = 0
+
+    if c > c[1]
+        direction := 1
+    else if c < c[1]
+        direction := -1
+    else
+        direction := nz(direction[1], 0)
+
+    int previous = nz(direction[1], 0)
+
+    // Same reversal conditions as chart triangles.
+    bool greenTriangle = direction == 1 and previous == -1
+    bool redTriangle = direction == -1 and previous == 1
+
+    // Record actual reversal events.
+    int signal = greenTriangle ? 1 : redTriangle ? -1 : 0
+
+    // Most recent reversal direction.
+    int lastSignal = nz(
+         ta.valuewhen(signal != 0, signal, 0),
+         0)
+
+    // Candles elapsed since the most recent triangle.
+    int barsSinceSignal = nz(
+         ta.barssince(signal != 0),
+         100000)
+
+    // Include latest candle, including developing signals.
+    [lastSignal, barsSinceSignal]
+
+
+
+
+//=====================================================================
+// SYMBOL LIST PARSING
+//=====================================================================
+
+var array<string> symbols = array.new_string()
+
+if barstate.isfirst
+    array<string> rawSymbols = str.split(tickerList, ",")
+
+    for i = 0 to array.size(rawSymbols) - 1
+        string sym = str.upper(str.trim(array.get(rawSymbols, i)))
+
+        if str.length(sym) > 0 and not array.includes(symbols, sym)
+            if array.size(symbols) < maxSymbols
+                array.push(symbols, sym)
+
+//=====================================================================
+// SCANNER RESULTS
+//=====================================================================
+
+var array<string> matchedSymbols = array.new_string()
+var array<int> matchedDirections = array.new_int()
+var array<int> matchedAges = array.new_int()
+
+array.clear(matchedSymbols)
+array.clear(matchedDirections)
+array.clear(matchedAges)
+
+if scanEnabled and array.size(symbols) > 0
+    for i = 0 to array.size(symbols) - 1
+        string sym = array.get(symbols, i)
+
+        
+        [dir, age] = request.security(
+            sym,
+            scanTF,
+            pulseScan(),
+            gaps=barmerge.gaps_off,
+            lookahead=barmerge.lookahead_on,
+            ignore_invalid_symbol=true,
+            calc_bars_count=500)
+
+
+        if not na(dir) and not na(age) and age < scanBars
+            if dir == 1 or dir == -1
+                array.push(matchedSymbols, sym)
+                array.push(matchedDirections, dir)
+                array.push(matchedAges, age)
+
+
+//=====================================================================
+// SORT RESULTS BY MOST RECENT REVERSAL
+//=====================================================================
+
+if array.size(matchedAges) > 1
+    for i = 0 to array.size(matchedAges) - 2
+        for j = i + 1 to array.size(matchedAges) - 1
+            int ageI = array.get(matchedAges, i)
+            int ageJ = array.get(matchedAges, j)
+
+            if ageJ < ageI
+                // Swap ages
+                array.set(matchedAges, i, ageJ)
+                array.set(matchedAges, j, ageI)
+
+                // Swap ticker symbols
+                string symI = array.get(matchedSymbols, i)
+                string symJ = array.get(matchedSymbols, j)
+
+                array.set(matchedSymbols, i, symJ)
+                array.set(matchedSymbols, j, symI)
+
+                // Swap directions
+                int dirI = array.get(matchedDirections, i)
+                int dirJ = array.get(matchedDirections, j)
+
+                array.set(matchedDirections, i, dirJ)
+                array.set(matchedDirections, j, dirI)
+
+
+//=====================================================================
+// CREATES COMPACT TABLE ON BOTTOM LEFT
+//=====================================================================
+
+fontSize = scanFont == "Tiny" ? size.tiny : scanFont == "Small" ? size.small : scanFont == "Large" ? size.large : size.normal
+
+color headerBG = color.rgb(24, 24, 24)
+color tableBG = color.rgb(0, 0, 0)
+color bullColor = color.rgb(0, 225, 120)
+color bearColor = color.rgb(255, 65, 70)
+
+var table monitor = table.new(
+     position.bottom_left,
+     3, 65,
+     bgcolor=tableBG,
+     frame_color=color.rgb(75, 75, 75),
+     frame_width=1,
+     border_color=color.rgb(35, 35, 35),
+     border_width=1)
+
+if barstate.islast
+    table.clear(monitor, 0, 0, 2, 64)
+
+    if scanEnabled
+        table.cell(monitor, 0, 0, "TICKER",
+             bgcolor=headerBG,
+             text_color=color.white,
+             text_size=fontSize)
+
+        table.cell(monitor, 1, 0, "SIGNAL",
+             bgcolor=headerBG,
+             text_color=color.white,
+             text_size=fontSize)
+
+        table.cell(monitor, 2, 0, "BARS",
+             bgcolor=headerBG,
+             text_color=color.white,
+             text_size=fontSize)
+
+        int count = array.size(matchedSymbols)
+
+        if count > 0
+            for i = 0 to count - 1
+                string sym = array.get(matchedSymbols, i)
+                int dir = array.get(matchedDirections, i)
+                int age = array.get(matchedAges, i)
+
+                // Remove exchange prefix.
+                array<string> parts = str.split(sym, ":")
+                string ticker = array.get(parts, array.size(parts) - 1)
+
+                bool bullish = dir == 1
+                color signalColor = bullish ? bullColor : bearColor
+                string signalText = bullish ? "▲ BULL" : "▼ BEAR"
+
+                int row = i + 1
+
+                table.cell(monitor, 0, row, ticker,
+                     text_color=color.white,
+                     text_size=fontSize)
+
+                table.cell(monitor, 1, row, signalText,
+                     text_color=signalColor,
+                     text_size=fontSize)
+
+                table.cell(monitor, 2, row, str.tostring(age),
+                     text_color=color.yellow,
+                     text_size=fontSize)
+        else
+            table.cell(monitor, 0, 1, "No recent reversals",
+                 text_color=color.gray,
+                 text_size=fontSize)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//=====================================================================
+// CENTER PULSE — PIVOT REVERSAL AND MIRRORED PRICE TARGET
+//=====================================================================
+
+const string bounceGroup = "Center Pulse Pivot Target"
+
+bounceEnabled = input.bool(true, "Enable Pivot Targets", group=bounceGroup)
+bounceHistoryBars = input.int(200, "Historical Candles To Display", minval=50, maxval=2000, group=bounceGroup)
+bounceLookback = input.int(5, "Minimum Candles For Center Interaction", minval=3, maxval=30, group=bounceGroup)
+bouncePivotStrength = input.int(2, "Pivot Confirmation Candles", minval=1, maxval=10, group=bounceGroup)
+bounceFlatBars = input.int(3, "Minimum Straight Center Candles", minval=3, maxval=20, group=bounceGroup)
+bounceLineWidth = input.int(2, "Target Line Width", minval=1, maxval=5, group=bounceGroup)
+bounceLineColor = input.color(color.rgb(255, 145, 0), "Target Line Color", group=bounceGroup)
+bounceShowDebug = input.bool(true, "Highlight Active Target Pivot", group=bounceGroup)
+
+
+//=====================================================================
+// 1. DETECT CENTER INTERACTION
+//=====================================================================
+
+float bounceDistance = close - centerTrack
+float bouncePreviousDistance = close[1] - centerTrack[1]
+
+bool bounceCrossedCenter = (bounceDistance > 0 and bouncePreviousDistance < 0) or (bounceDistance < 0 and bouncePreviousDistance > 0)
+bool bounceWickTouchedCenter = low <= centerTrack and high >= centerTrack
+bool bounceApproachedCenter = math.abs(bounceDistance) < math.abs(bouncePreviousDistance)
+bool bounceMovedAway = math.abs(bounceDistance) > math.abs(bouncePreviousDistance)
+bool bounceInteraction = bounceCrossedCenter or bounceWickTouchedCenter or bounceApproachedCenter or bounceMovedAway
+
+int bounceInteractionCount = 0
+
+for i = 0 to bounceLookback - 1
+    if bounceInteraction[i]
+        bounceInteractionCount += 1
+
+bool bounceInteractionQualified = bounceInteractionCount >= bounceLookback
+
+
+//=====================================================================
+// 2. CONFIRMED PRICE PIVOTS
+//=====================================================================
+
+float bouncePivotHigh = ta.pivothigh(high, bouncePivotStrength, bouncePivotStrength)
+float bouncePivotLow = ta.pivotlow(low, bouncePivotStrength, bouncePivotStrength)
+
+bool bounceHighConfirmed = not na(bouncePivotHigh)
+bool bounceLowConfirmed = not na(bouncePivotLow)
+
+
+//=====================================================================
+// 3. VALIDATE STRAIGHT CENTRAL LINE
+//=====================================================================
+
+bool bounceCenterShifted = na(centerTrack) or (not na(centerTrack[1]) and centerTrack != centerTrack[1])
+
+var int bounceFlatCount = 0
+var int bounceFlatStartBar = na
+var float bounceFlatCenter = na
+
+if barstate.isconfirmed
+    if na(centerTrack)
+        bounceFlatCount := 0
+        bounceFlatStartBar := na
+        bounceFlatCenter := na
+    else if na(centerTrack[1]) or bounceCenterShifted
+        bounceFlatCount := 1
+        bounceFlatStartBar := bar_index
+        bounceFlatCenter := centerTrack
+    else
+        bounceFlatCount += 1
+
+bool bounceCenterQualified = bounceFlatCount >= bounceFlatBars and not na(bounceFlatCenter)
+
+
+//=====================================================================
+// 4. TRACK THE LARGEST PIVOT AND ACTIVE TARGET
+//=====================================================================
+
+var float bounceUpperExtreme = na
+var float bounceLowerExtreme = na
+var int bounceUpperPivotBar = na
+var int bounceLowerPivotBar = na
+
+var line bounceActiveLine = na
+var label bounceActiveLabel = na
+var label bounceActivePivotMarker = na
+
+var float bounceActivePrice = na
+var float bounceActiveDistance = na
+var float bounceActivePivotPrice = na
+
+var int bounceActiveDirection = 0
+var int bounceActiveBar = na
+
+var bool bounceTargetActive = false
+
+
+//=====================================================================
+// 5. PROCESS CONFIRMED CANDLES
+//=====================================================================
+
+if bounceEnabled and barstate.isconfirmed
+
+    //=============================================================
+    // RESET WHEN CENTRAL LINE SHIFTS
+    //=============================================================
+
+    if bounceCenterShifted
+        bounceUpperExtreme := na
+        bounceLowerExtreme := na
+        bounceUpperPivotBar := na
+        bounceLowerPivotBar := na
+
+        if not na(bounceActiveLine)
+            line.delete(bounceActiveLine)
+
+        if not na(bounceActiveLabel)
+            label.delete(bounceActiveLabel)
+
+        if not na(bounceActivePivotMarker)
+            label.delete(bounceActivePivotMarker)
+
+        bounceActiveLine := na
+        bounceActiveLabel := na
+        bounceActivePivotMarker := na
+        bounceActivePrice := na
+        bounceActiveDistance := na
+        bounceActivePivotPrice := na
+        bounceActiveDirection := 0
+        bounceActiveBar := na
+        bounceTargetActive := false
+
+
+    //=============================================================
+    // PROCESS ONLY WHEN CENTER IS STRAIGHT
+    //=============================================================
+
+    if bounceCenterQualified
+
+        //=========================================================
+        // UPDATE ACTIVE TARGET AND CHECK FOR HIT
+        //=========================================================
+
+        if bounceTargetActive and not na(bounceActiveLine)
+            bool targetReached = bounceActiveDirection == 1 ? low <= bounceActivePrice : high >= bounceActivePrice
+
+            if bar_index > bounceActiveBar and targetReached
+                line.delete(bounceActiveLine)
+                label.delete(bounceActiveLabel)
+
+                if not na(bounceActivePivotMarker)
+                    label.delete(bounceActivePivotMarker)
+
+                bounceActiveLine := na
+                bounceActiveLabel := na
+                bounceActivePivotMarker := na
+                bounceActivePrice := na
+                bounceActiveDistance := na
+                bounceActivePivotPrice := na
+                bounceActiveDirection := 0
+                bounceActiveBar := na
+                bounceTargetActive := false
+            else
+                line.set_x2(bounceActiveLine, bar_index)
+                label.set_x(bounceActiveLabel, bar_index)
+                label.set_y(bounceActiveLabel, bounceActivePrice)
+
+
+        //=========================================================
+        // DETECT CONFIRMED HIGH PIVOT
+        //=========================================================
+
+        if bounceHighConfirmed
+            int pivotBar = bar_index - bouncePivotStrength
+            bool pivotInsideFlat = pivotBar >= bounceFlatStartBar
+            bool pivotCenterValid = centerTrack[bouncePivotStrength] == bounceFlatCenter
+            bool pivotBodyValid = open[bouncePivotStrength] > bounceFlatCenter and close[bouncePivotStrength] > bounceFlatCenter
+
+            if pivotInsideFlat and pivotCenterValid and pivotBodyValid and bouncePivotHigh > bounceFlatCenter
+                if na(bounceUpperExtreme) or bouncePivotHigh > bounceUpperExtreme
+                    bounceUpperExtreme := bouncePivotHigh
+                    bounceUpperPivotBar := pivotBar
+
+
+        //=========================================================
+        // DETECT CONFIRMED LOW PIVOT
+        //=========================================================
+
+        if bounceLowConfirmed
+            int pivotBar = bar_index - bouncePivotStrength
+            bool pivotInsideFlat = pivotBar >= bounceFlatStartBar
+            bool pivotCenterValid = centerTrack[bouncePivotStrength] == bounceFlatCenter
+            bool pivotBodyValid = open[bouncePivotStrength] < bounceFlatCenter and close[bouncePivotStrength] < bounceFlatCenter
+
+            if pivotInsideFlat and pivotCenterValid and pivotBodyValid and bouncePivotLow < bounceFlatCenter
+                if na(bounceLowerExtreme) or bouncePivotLow < bounceLowerExtreme
+                    bounceLowerExtreme := bouncePivotLow
+                    bounceLowerPivotBar := pivotBar
+
+
+        //=========================================================
+        // SELECT LARGEST CONFIRMED PIVOT IN EITHER DIRECTION
+        //=========================================================
+
+        float bounceCandidateDistance = na
+        float bounceCandidatePivotPrice = na
+        int bounceCandidatePivotBar = na
+        int bounceCandidateDirection = 0
+
+        if not na(bounceUpperExtreme)
+            float upperDistance = bounceUpperExtreme - bounceFlatCenter
+
+            if upperDistance > 0
+                bounceCandidateDistance := upperDistance
+                bounceCandidatePivotPrice := bounceUpperExtreme
+                bounceCandidatePivotBar := bounceUpperPivotBar
+                bounceCandidateDirection := 1
+
+        if not na(bounceLowerExtreme)
+            float lowerDistance = bounceFlatCenter - bounceLowerExtreme
+
+            if lowerDistance > 0 and (na(bounceCandidateDistance) or lowerDistance > bounceCandidateDistance)
+                bounceCandidateDistance := lowerDistance
+                bounceCandidatePivotPrice := bounceLowerExtreme
+                bounceCandidatePivotBar := bounceLowerPivotBar
+                bounceCandidateDirection := -1
+
+
+        //=========================================================
+        // CREATE OR REPLACE TARGET IMMEDIATELY
+        //=========================================================
+
+        if not na(bounceCandidateDistance) and bounceInteractionQualified
+            bool replaceTarget = not bounceTargetActive or bounceCandidateDistance > bounceActiveDistance
+
+            if replaceTarget
+                if not na(bounceActiveLine)
+                    line.delete(bounceActiveLine)
+
+                if not na(bounceActiveLabel)
+                    label.delete(bounceActiveLabel)
+
+                if not na(bounceActivePivotMarker)
+                    label.delete(bounceActivePivotMarker)
+
+                float targetPrice = 2.0 * bounceFlatCenter - bounceCandidatePivotPrice
+
+                bounceActiveLine := line.new(x1=bar_index, y1=targetPrice, x2=bar_index + 1, y2=targetPrice, xloc=xloc.bar_index, extend=extend.none, color=bounceLineColor, width=bounceLineWidth)
+                bounceActiveLabel := label.new(x=bar_index + 1, y=targetPrice, text=str.tostring(targetPrice, format.mintick), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=bounceLineColor, textcolor=color.white, size=size.small)
+
+                if bounceShowDebug
+                    string pivotSymbol = bounceCandidateDirection == 1 ? "▼" : "▲"
+                    bounceActivePivotMarker := label.new(x=bounceCandidatePivotBar, y=bounceCandidatePivotPrice, text=pivotSymbol, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_none, color=color.new(color.black, 100), textcolor=bounceLineColor, size=size.large)
+                else
+                    bounceActivePivotMarker := na
+
+                bounceActivePrice := targetPrice
+                bounceActiveDistance := bounceCandidateDistance
+                bounceActivePivotPrice := bounceCandidatePivotPrice
+                bounceActiveDirection := bounceCandidateDirection
+                bounceActiveBar := bar_index
+                bounceTargetActive := true
+
+
+//=====================================================================
+// END — CENTER PULSE PIVOT TARGET
+//=====================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//=====================================================================
+// DAILY AND WEEKLY PULSE DIRECTIONAL BIAS
+// ZERO ADDITIONAL REQUEST.SECURITY CALLS
+//=====================================================================
+
+const string biasGroup = "Pulse Directional Bias"
+
+biasEnabled = input.bool(true, "Show Directional Bias", group=biasGroup)
+biasTransparency = input.int(15, "Text Transparency", minval=0, maxval=95, group=biasGroup)
+biasBackgroundTransparency = input.int(75, "Background Transparency", minval=0, maxval=100, group=biasGroup)
+biasFont = input.string("Large", "Text Size", options=["Small", "Normal", "Large", "Huge"], group=biasGroup)
+biasBullColor = input.color(color.rgb(0, 205, 115), "Bull Background Color", group=biasGroup)
+biasBearColor = input.color(color.rgb(255, 65, 70), "Bear Background Color", group=biasGroup)
+biasNeutralColor = input.color(color.gray, "Neutral Background Color", group=biasGroup)
+
+//=====================================================================
+// 1. TRACK CURRENT DAILY AND WEEKLY CANDLES
+//=====================================================================
+
+bool biasNewDay = timeframe.change("D")
+bool biasNewWeek = timeframe.change("W")
+
+var float biasDayCenter = na
+var float biasWeekCenter = na
+
+var int biasDayDirection = 0
+var int biasWeekDirection = 0
+
+//=====================================================================
+// 2. CALCULATE DAILY AND WEEKLY PULSE DIRECTION
+//=====================================================================
+
+if biasNewDay or na(biasDayCenter)
+    biasDayCenter := centerTrack
+    biasDayDirection := trackDirection
+
+if biasNewWeek or na(biasWeekCenter)
+    biasWeekCenter := centerTrack
+    biasWeekDirection := trackDirection
+
+if centerTrack > biasDayCenter
+    biasDayDirection := 1
+else if centerTrack < biasDayCenter
+    biasDayDirection := -1
+
+if centerTrack > biasWeekCenter
+    biasWeekDirection := 1
+else if centerTrack < biasWeekCenter
+    biasWeekDirection := -1
+
+//=====================================================================
+// 3. FORMAT DIRECTIONAL BIAS
+//=====================================================================
+
+string biasDayText = biasDayDirection == 1 ? "Bull" : biasDayDirection == -1 ? "Bear" : "Neutral"
+string biasWeekText = biasWeekDirection == 1 ? "Bull" : biasWeekDirection == -1 ? "Bear" : "Neutral"
+
+color biasDayBackground = color.new(biasDayDirection == 1 ? biasBullColor : biasDayDirection == -1 ? biasBearColor : biasNeutralColor, biasBackgroundTransparency)
+color biasWeekBackground = color.new(biasWeekDirection == 1 ? biasBullColor : biasWeekDirection == -1 ? biasBearColor : biasNeutralColor, biasBackgroundTransparency)
+
+color biasTextColor = color.new(color.white, biasTransparency)
+
+biasTextSize = biasFont == "Small" ? size.small : biasFont == "Normal" ? size.normal : biasFont == "Huge" ? size.huge : size.large
+
+//=====================================================================
+// 4. TRANSPARENT DIRECTIONAL BIAS DISPLAY
+//=====================================================================
+
+var table biasTable = table.new(position.top_right, 1, 2, bgcolor=color.new(color.black, 100), border_width=0)
+
+if barstate.islast
+    table.cell(biasTable, 0, 0, biasEnabled ? "Day: " + biasDayText : "", text_color=biasTextColor, text_size=biasTextSize, text_halign=text.align_center, bgcolor=biasEnabled ? biasDayBackground : color.new(color.black, 100))
+    table.cell(biasTable, 0, 1, biasEnabled ? "Week: " + biasWeekText : "", text_color=biasTextColor, text_size=biasTextSize, text_halign=text.align_center, bgcolor=biasEnabled ? biasWeekBackground : color.new(color.black, 100))
+
+//=====================================================================
+// END — DAILY AND WEEKLY DIRECTIONAL BIAS
+//=====================================================================
