@@ -1,1 +1,842 @@
 
+
+ //@version=6
+indicator("Adaptive Pivot Odds | Swing-Balanced", "Pivot Risk", overlay=true, max_labels_count=100)
+
+// ============================================================================
+// 1. SETTINGS
+// ============================================================================
+
+string G1 = "01 | Swing Clock-compatible pivots"
+
+string swingSize = input.string("Standard", "Swing size", options=["Micro", "Standard", "Major", "Custom"], group=G1)
+float customK = input.float(2.5, "Custom ATR multiplier", minval=0.5, step=0.1, group=G1)
+int atrLength = input.int(14, "ATR length", minval=2, group=G1)
+string pivotSource = input.string("Wicks", "Pivot source", options=["Wicks", "Closes"], group=G1)
+
+float K = swingSize == "Micro" ? 1.5 : swingSize == "Major" ? 4.0 : swingSize == "Custom" ? customK : 2.5
+
+string G2 = "02 | Rolling statistical model"
+
+int lookback = input.int(2000, "Historical candles", minval=100, maxval=10000, group=G2)
+int sampleEvery = input.int(3, "Historical state sampling (bars)", minval=1, maxval=20, group=G2)
+int minSwings = input.int(12, "Minimum completed swings", minval=5, maxval=100, group=G2)
+float minNeff = input.float(6.0, "Minimum effective swings", minval=2, maxval=100, group=G2)
+float bandwidth = input.float(1.8, "Similarity bandwidth", minval=0.5, maxval=5.0, step=0.1, group=G2)
+float prior = input.float(5.0, "Shrinkage (swing-equivalents)", minval=0.0, maxval=50.0, group=G2)
+float otherDirWeight = input.float(0.8, "Opposite-swing weight", minval=0.0, maxval=1.0, step=0.05, group=G2)
+
+string G3 = "03 | Chart display"
+
+bool paintBars = input.bool(true, "Color candles by directional probability", group=G3)
+bool showCurrent = input.bool(true, "Latest candle label", group=G3)
+bool showHistory = input.bool(true, "Historical validation labels", group=G3)
+int historyCount = input.int(5, "Previous forecasts", minval=1, maxval=20, group=G3)
+float checkpointRetrace = input.float(0.15, "Validation checkpoint (fraction of reversal)", minval=0.0, maxval=0.9, step=0.05, group=G3)
+bool showDebug = input.bool(false, "Show support/validation details", group=G3)
+float labelOffset = input.float(0.35, "Label offset (ATR)", minval=0.0, step=0.05, group=G3)
+
+color upCol = input.color(#00E5B4, "Upward", group=G3, inline="colors")
+color downCol = input.color(#FF4D6D, "Downward", group=G3, inline="colors")
+
+// ============================================================================
+// 2. FUNCTIONS
+// ============================================================================
+
+f_clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(v, hi))
+
+
+f_distance(float a1, float a2, float a3, float a4, float a5, float b1, float b2, float b3, float b4, float b5) =>
+    float x1 = (a1 - b1) / 0.25
+    float x2 = (a2 - b2) / 1.0
+    float x3 = (a3 - b3) / 0.8
+    float x4 = (a4 - b4) / 0.9
+    float x5 = (a5 - b5) / 2.5
+
+    math.sqrt(x1*x1 + x2*x2 + x3*x3 + x4*x4 + x5*x5)
+
+// Faint color near 50%, progressively stronger as confidence increases.
+// 50% here is a split between bullish and bearish
+
+f_gradient(bool up, float confidence, color green, color red) =>
+    color base = up ? green : red
+    color.from_gradient(confidence, 50.0, 100.0, color.new(base, 89), color.new(base, 8))
+
+// ============================================================================
+// 3. RESOLVED HISTORICAL SWING DATABASE
+// ============================================================================
+
+var array<int> trBar = array.new_int()
+var array<int> trSwing = array.new_int()
+var array<int> trDir = array.new_int()
+
+var array<float> tr1 = array.new_float()
+var array<float> tr2 = array.new_float()
+var array<float> tr3 = array.new_float()
+var array<float> tr4 = array.new_float()
+var array<float> tr5 = array.new_float()
+
+var array<int> trY = array.new_int()
+
+// ============================================================================
+// 4. UNRESOLVED SWING OBSERVATIONS
+// ============================================================================
+
+var array<int> liveBar = array.new_int()
+
+var array<float> live1 = array.new_float()
+var array<float> live2 = array.new_float()
+var array<float> live3 = array.new_float()
+var array<float> live4 = array.new_float()
+var array<float> live5 = array.new_float()
+
+// ============================================================================
+// 5. FROZEN HISTORICAL FORECASTS
+// ============================================================================
+
+var array<int> vBar = array.new_int()
+var array<float> vPrice = array.new_float()
+var array<float> vATR = array.new_float()
+var array<float> vUpProb = array.new_float()
+var array<float> vBaseUp = array.new_float()
+var array<int> vActualUp = array.new_int()
+
+var array<label> drawn = array.new_label()
+var label liveLabel = na
+
+// ============================================================================
+// 6. ATR AND MARKET INFORMATION
+// ============================================================================
+
+float rawAtr = ta.atr(atrLength)
+
+float atr = na(rawAtr) ? na : math.max(rawAtr, 2.0 * syminfo.mintick)
+
+float safeATR = nz(atr, math.max(high - low, syminfo.mintick))
+
+float srcHigh = pivotSource == "Closes" ? close : high
+float srcLow = pivotSource == "Closes" ? close : low
+
+float mom = na(close[3]) or na(atr) ? 0.0 : (close - close[3]) / (3.0 * atr)
+
+// ============================================================================
+// 7. ATR SWING ENGINE
+// ============================================================================
+
+// +1: currently extending an upward swing
+// -1: currently extending a downward swing
+//
+// Swing confirmation follows the extension-then-retracement
+// sequence of the supplied Swing Clock engine.
+
+var bool started = false
+var int direction = 1
+var int swingID = 0
+
+var float swingStart = na
+var float swingStartATR = na
+
+var float peak = na
+var int peakBar = na
+var float peakATR = na
+var float deep = na
+
+var float lastHighPivot = na
+var float lastLowPivot = na
+
+// One historical validation checkpoint per candidate extreme.
+
+var bool checkpointLive = false
+var int checkpointBar = na
+var float checkpointPrice = na
+var float checkpointATR = na
+var float checkpointPUp = na
+var float checkpointBaseUp = na
+
+var float pFinal = na
+var float pUp = na
+var float pBase = na
+var float neff = na
+var int nSwings = 0
+
+var string modelStatus = "ATR WARMUP"
+
+bool madeExtreme = false
+bool justConfirmed = false
+
+// ============================================================================
+// 8. PROCESS CONFIRMED CANDLES
+// ============================================================================
+
+if barstate.isconfirmed and not na(atr)
+
+    // ----------------------------------------------------
+    // A. Expire historical training observations
+    // ----------------------------------------------------
+
+    while array.size(trBar) > 0
+        if array.get(trBar, 0) < bar_index - lookback
+            array.shift(trBar)
+            array.shift(trSwing)
+            array.shift(trDir)
+            array.shift(tr1)
+            array.shift(tr2)
+            array.shift(tr3)
+            array.shift(tr4)
+            array.shift(tr5)
+            array.shift(trY)
+        else
+            break
+
+    // ----------------------------------------------------
+    // B. Initialize the provisional swing
+    // ----------------------------------------------------
+
+    if not started
+        started := true
+        direction := 1
+
+        swingStart := srcLow
+        swingStartATR := atr
+
+        peak := srcHigh
+        peakATR := atr
+        peakBar := bar_index
+
+        deep := close
+
+        modelStatus := "INITIAL SWING"
+
+    else
+        int previousDirection = direction
+
+        float mirroredHi = previousDirection > 0 ? srcHigh : -srcLow
+        float mirroredLo = previousDirection > 0 ? srcLow : -srcHigh
+        float mirroredCl = previousDirection * close
+
+        float mirroredPeak = previousDirection * peak
+        float mirroredDeep = previousDirection * deep
+
+        // ----------------------------------------------------
+        // C. Extension of the current swing extreme
+        // ----------------------------------------------------
+
+        madeExtreme := mirroredHi > mirroredPeak
+
+        if madeExtreme
+
+            // If a previous extreme had a frozen forecast,
+            // the later extension establishes its outcome.
+
+            if checkpointLive
+
+                array.push(vBar, checkpointBar)
+                array.push(vPrice, checkpointPrice)
+                array.push(vATR, checkpointATR)
+                array.push(vUpProb, checkpointPUp)
+                array.push(vBaseUp, checkpointBaseUp)
+
+                array.push(vActualUp, previousDirection > 0 ? 1 : 0)
+
+                checkpointLive := false
+
+            mirroredPeak := mirroredHi
+            peakBar := bar_index
+            peakATR := atr
+
+            // Match Swing Clock's new-extreme update.
+            mirroredDeep := mirroredCl
+
+        else
+            mirroredDeep := math.min(mirroredDeep, mirroredLo)
+
+        peak := previousDirection * mirroredPeak
+        deep := previousDirection * mirroredDeep
+
+        // ----------------------------------------------------
+        // D. Confirm the completed ATR swing
+        // ----------------------------------------------------
+
+        justConfirmed := mirroredPeak - mirroredDeep >= K * peakATR
+
+        if justConfirmed
+
+            int count = array.size(liveBar)
+
+            if count > 0
+                for j = 0 to count - 1
+
+                    int b = array.get(liveBar, j)
+
+                    if b >= bar_index - lookback
+
+                        array.push(trBar, b)
+                        array.push(trSwing, swingID)
+                        array.push(trDir, previousDirection)
+
+                        array.push(tr1, array.get(live1, j))
+                        array.push(tr2, array.get(live2, j))
+                        array.push(tr3, array.get(live3, j))
+                        array.push(tr4, array.get(live4, j))
+                        array.push(tr5, array.get(live5, j))
+
+                        array.push(trY, b >= peakBar ? 1 : 0)
+
+            array.clear(liveBar)
+            array.clear(live1)
+            array.clear(live2)
+            array.clear(live3)
+            array.clear(live4)
+            array.clear(live5)
+
+            swingID += 1
+
+            // Resolve the surviving frozen forecast.
+
+            if checkpointLive
+
+                array.push(vBar, checkpointBar)
+                array.push(vPrice, checkpointPrice)
+                array.push(vATR, checkpointATR)
+                array.push(vUpProb, checkpointPUp)
+                array.push(vBaseUp, checkpointBaseUp)
+
+                // A confirmed high implies the down outcome.
+                // A confirmed low implies the up outcome.
+
+                array.push(vActualUp, previousDirection > 0 ? 0 : 1)
+
+                checkpointLive := false
+
+            // Preserve previously confirmed structural pivots.
+
+            if previousDirection > 0
+                lastHighPivot := peak
+            else
+                lastLowPivot := peak
+
+            // ------------------------------------------------
+            // E. Initialize the opposite swing
+            // ------------------------------------------------
+
+            float oldPeak = peak
+            float oldPeakATR = peakATR
+
+            direction := -previousDirection
+
+            swingStart := oldPeak
+            swingStartATR := oldPeakATR
+
+            // The opposite swing starts from the accumulated
+            // retracement extreme, not an arbitrary new price.
+
+            peak := deep
+            peakBar := bar_index
+            peakATR := atr
+            deep := close
+
+    // ========================================================================
+    // 9. CURRENT MARKET-STATE FEATURES
+    // ========================================================================
+
+    // Fraction of the ATR confirmation threshold already retraced.
+    float rho = f_clamp(
+         direction * (peak - close) /
+         math.max(K * peakATR, syminfo.mintick),
+         0.0, 1.0)
+
+    // Duration since the current extreme.
+    float age = math.log(
+         1.0 + math.max(bar_index - peakBar, 0))
+
+    // Swing amplitude relative to the required reversal size.
+    float amplitude = f_clamp(
+         direction * (peak - swingStart) /
+         math.max(K * swingStartATR, syminfo.mintick),
+         0.0, 5.0)
+
+    // Signed momentum relative to the active swing.
+    float momentum = f_clamp(
+         direction * mom,
+         -3.0, 3.0)
+
+    // Proximity to the previous confirmed same-side pivot.
+    // The sign distinguishes a breakout from a lower high
+    // or a higher low.
+
+    float previousLevel = direction > 0 ? lastHighPivot : lastLowPivot
+
+    float levelDistance = na(previousLevel) ?
+         4.0 :
+         f_clamp(
+             direction * (peak - previousLevel) / atr,
+             -4.0, 4.0)
+
+    // ========================================================================
+    // 10. SWING-BALANCED CONDITIONAL PROBABILITY
+    // ========================================================================
+
+    // Evaluate forecasts within the most recent historical window.
+    // Older bars still contribute completed swings to training.
+
+    if bar_index >= last_bar_index - lookback
+
+        float sumW = 0.0
+        float sumW2 = 0.0
+        float sumWY = 0.0
+
+        int positiveSwings = 0
+        int negativeSwings = 0
+
+        nSwings := 0
+
+        int countTrain = array.size(trBar)
+        int previousID = -1
+
+        float bestDist = 1e20
+        int bestY = 0
+        int bestDir = 0
+
+        // ----------------------------------------------------
+        // A. Find the closest historical state per swing
+        // ----------------------------------------------------
+
+        if countTrain > 0
+
+            for i = 0 to countTrain - 1
+
+                int recordID = array.get(trSwing, i)
+
+                float d = f_distance(
+                     rho, age, amplitude, momentum, levelDistance,
+                     array.get(tr1, i),
+                     array.get(tr2, i),
+                     array.get(tr3, i),
+                     array.get(tr4, i),
+                     array.get(tr5, i))
+
+                // A different completed swing begins.
+
+                if recordID != previousID
+
+                    // Finalize the closest state of the previous swing.
+                    if previousID != -1
+
+                        float w = math.exp(
+                             -0.5 * math.pow(bestDist / bandwidth, 2)) *
+                             (bestDir == direction ? 1.0 : otherDirWeight)
+
+                        sumW += w
+                        sumW2 += w * w
+                        sumWY += w * bestY
+
+                        nSwings += 1
+
+                        if bestY == 1
+                            positiveSwings += 1
+                        else
+                            negativeSwings += 1
+
+                    previousID := recordID
+
+                    bestDist := d
+                    bestY := array.get(trY, i)
+                    bestDir := array.get(trDir, i)
+
+                else if d < bestDist
+
+                    bestDist := d
+                    bestY := array.get(trY, i)
+                    bestDir := array.get(trDir, i)
+
+            // Finalize the last completed swing.
+
+            if previousID != -1
+
+                float w = math.exp(
+                     -0.5 * math.pow(bestDist / bandwidth, 2)) *
+                     (bestDir == direction ? 1.0 : otherDirWeight)
+
+                sumW += w
+                sumW2 += w * w
+                sumWY += w * bestY
+
+                nSwings += 1
+
+                if bestY == 1
+                    positiveSwings += 1
+                else
+                    negativeSwings += 1
+
+        // ----------------------------------------------------
+        // B. Effective independent-swing sample
+        // ----------------------------------------------------
+
+        neff := sumW2 > 0.0 ?
+             sumW * sumW / sumW2 :
+             0.0
+
+        // Smoothed historical base rate.
+        pBase := nSwings > 0 ?
+             (positiveSwings + 1.0) / (nSwings + 2.0) :
+             na
+
+        bool enough = nSwings >= minSwings and
+             positiveSwings >= 2 and
+             negativeSwings >= 2
+
+        bool supported = neff >= minNeff and sumW >= 1.5
+
+        pFinal := na
+        pUp := na
+
+        // ----------------------------------------------------
+        // C. Regularized local outcome probability
+        // ----------------------------------------------------
+
+        if enough and supported
+
+            pFinal := f_clamp(
+                 (sumWY + prior * pBase) /
+                 (sumW + prior),
+                 0.001, 0.999)
+
+            // Convert the final-extreme probability into
+            // upward-vs-downward resolution odds.
+            //
+            // Upward swing:
+            //   final high  -> down
+            //   extension   -> up
+            //
+            // Downward swing:
+            //   final low   -> up
+            //   extension   -> down
+
+            pUp := direction > 0 ?
+                 (1.0 - pFinal) :
+                 pFinal
+
+            modelStatus := "ESTIMATE"
+
+        else
+
+            modelStatus := not enough ?
+                 "TOO FEW RESOLVED SWINGS" :
+                 "LOW COMPARABLE SUPPORT"
+
+        // ----------------------------------------------------
+        // D. Freeze one historical forecast per candidate
+        // ----------------------------------------------------
+
+        // Historical validation starts after the candidate
+        // reaches a predefined fraction of the reversal
+        // threshold. The forecast is never backdated.
+
+        if not checkpointLive and
+             not justConfirmed and
+             not na(pUp) and
+             rho >= checkpointRetrace
+
+            checkpointLive := true
+
+            checkpointBar := bar_index
+            checkpointPrice := pUp >= 0.5 ? low : high
+            checkpointATR := atr
+
+            checkpointPUp := pUp
+
+            checkpointBaseUp := direction > 0 ?
+                 1.0 - pBase :
+                 pBase
+
+    else
+
+        pFinal := na
+        pUp := na
+        modelStatus := "OUTSIDE FORECAST WINDOW"
+
+    // ========================================================================
+    // 11. RECORD STATES FOR FUTURE TRAINING
+    // ========================================================================
+
+    // Store these only while the swing is unresolved.
+    // They are incorporated into training after confirmation.
+
+    if not justConfirmed and
+         (bar_index % sampleEvery == 0 or
+          madeExtreme or
+          bar_index - peakBar == 1)
+
+        array.push(liveBar, bar_index)
+
+        array.push(live1, rho)
+        array.push(live2, age)
+        array.push(live3, amplitude)
+        array.push(live4, momentum)
+        array.push(live5, levelDistance)
+
+        // Bound memory for unusually long swings.
+
+        if array.size(liveBar) > 250
+
+            array.shift(liveBar)
+            array.shift(live1)
+            array.shift(live2)
+            array.shift(live3)
+            array.shift(live4)
+            array.shift(live5)
+
+    // Bound validation history independently of label count.
+
+    while array.size(vBar) > 400
+
+        array.shift(vBar)
+        array.shift(vPrice)
+        array.shift(vATR)
+        array.shift(vUpProb)
+        array.shift(vBaseUp)
+        array.shift(vActualUp)
+
+// ============================================================================
+// 12. PROBABILITY-BASED CANDLE COLORS
+// ============================================================================
+
+// The magnitude represents confidence in the favored
+// resolution direction.
+//
+// Approximately 50%: very faint.
+// Higher probabilities: progressively stronger color.
+
+float pctUp = not na(pUp) ? pUp * 100.0 : na
+
+float confidence = not na(pctUp) ?
+     math.max(pctUp, 100.0 - pctUp) :
+     na
+
+bool bullish = not na(pctUp) and pctUp >= 50.0
+
+color probabilityColor = not na(pctUp) ?
+     f_gradient(bullish, confidence, upCol, downCol) :
+     na
+
+barcolor(
+     paintBars and barstate.isconfirmed ? probabilityColor : na,
+     title="Directional probability gradient")
+
+// ============================================================================
+// 13. WALK-FORWARD VALIDATION
+// ============================================================================
+
+// For each resolved historical forecast:
+// Brier = (frozen predicted probability - actual outcome)^2
+//
+// Compare with the historical base-rate forecast frozen at
+// the same candle.
+
+int validationN = 0
+
+float modelBrier = na
+float baselineBrier = na
+
+if barstate.islast
+
+    float sumModelError = 0.0
+    float sumBaseError = 0.0
+
+    int nVal = array.size(vBar)
+
+    if nVal > 0
+
+        for i = 0 to nVal - 1
+
+            if array.get(vBar, i) >= bar_index - lookback
+
+                float y = float(array.get(vActualUp, i))
+
+                sumModelError += math.pow(
+                     array.get(vUpProb, i) - y, 2)
+
+                sumBaseError += math.pow(
+                     array.get(vBaseUp, i) - y, 2)
+
+                validationN += 1
+
+    if validationN > 0
+
+        modelBrier := sumModelError / validationN
+        baselineBrier := sumBaseError / validationN
+
+// ============================================================================
+// 14. CURRENT LABEL + HISTORICAL LABELS
+// ============================================================================
+
+if barstate.islast
+
+    // Keep exactly one current label.
+
+    if not na(liveLabel)
+        label.delete(liveLabel)
+        liveLabel := na
+
+    // Remove old rendered history labels before redrawing.
+
+    while array.size(drawn) > 0
+        label.delete(array.pop(drawn))
+
+    // --------------------------------------------------------
+    // A. Current probability
+    // --------------------------------------------------------
+
+    if showCurrent
+
+        bool valid = not na(pctUp)
+        bool up = valid and pctUp >= 50.0
+
+        float value = valid ?
+             math.max(pctUp, 100.0 - pctUp) :
+             na
+
+        string txt = valid ?
+             (up ? "▲ " : "▼ ") +
+             str.tostring(value, "#.0") + "%" :
+             "—"
+
+        if showDebug
+
+            txt += "\n" + modelStatus
+            txt += " | swings " + str.tostring(nSwings)
+            txt += " | Neff " + str.tostring(neff, "#.1")
+
+        color bg = valid ?
+             probabilityColor :
+             color.new(color.gray, 50)
+
+        float y = up ?
+             low - safeATR * labelOffset :
+             high + safeATR * labelOffset
+
+        string hint = valid ?
+             "Conditional swing-resolution estimate." +
+             "\nUpward outcome: " +
+             str.tostring(pctUp, "#.1") + "%" +
+             "\nExisting extreme final: " +
+             str.tostring(pFinal * 100, "#.1") + "%" :
+             modelStatus
+
+        liveLabel := label.new(
+             bar_index, y, txt,
+             xloc=xloc.bar_index,
+             style=up ?
+                 label.style_label_up :
+                 label.style_label_down,
+             color=bg,
+             textcolor=color.white,
+             size=size.normal,
+             tooltip=hint)
+
+    // --------------------------------------------------------
+    // B. Previous independently fitted predictions
+    // --------------------------------------------------------
+
+    if showHistory
+
+        int nVal = array.size(vBar)
+        int displayed = 0
+
+        if nVal > 0
+
+            for j = 0 to nVal - 1
+
+                int i = nVal - j - 1
+
+                int b = array.get(vBar, i)
+
+                bool eligible = displayed < historyCount and
+                     b >= bar_index - lookback and
+                     b >= bar_index - 9999
+
+                if eligible
+
+                    float pu = array.get(vUpProb, i)
+
+                    bool up = pu >= 0.5
+
+                    float conf = 100.0 *
+                         math.max(pu, 1.0 - pu)
+
+                    int actual = array.get(vActualUp, i)
+
+                    bool right =
+                         (up and actual == 1) or
+                         (not up and actual == 0)
+
+                    string txt = (up ? "▲ " : "▼ ") +
+                         str.tostring(conf, "#.0") + "%"
+
+                    color bg = f_gradient(
+                         up, conf, upCol, downCol)
+
+                    float y = array.get(vPrice, i) +
+                         (up ? -1.0 : 1.0) *
+                         array.get(vATR, i) *
+                         labelOffset
+
+                    string hint =
+                         "Historical forecast at this candle" +
+                         "\nPrediction: " +
+                         (up ? "upward" : "downward") +
+                         " " + str.tostring(conf, "#.1") + "%" +
+                         "\nResolved outcome: " +
+                         (actual == 1 ? "upward" : "downward") +
+                         "\n" +
+                         (right ? "Correct favored outcome" :
+                                  "Incorrect favored outcome") +
+                         "\nFrozen walk-forward prediction"
+
+                    label marker = label.new(
+                         b, y, txt,
+                         xloc=xloc.bar_index,
+                         style=up ?
+                             label.style_label_up :
+                             label.style_label_down,
+                         color=bg,
+                         textcolor=color.white,
+                         size=size.tiny,
+                         tooltip=hint)
+
+                    array.push(drawn, marker)
+
+                    displayed += 1
+
+// ============================================================================
+// 15. DATA-WINDOW DIAGNOSTICS
+// ============================================================================
+
+plot(pctUp,
+     "Conditional upward odds (%)",
+     display=display.data_window)
+
+plot(not na(pFinal) ? pFinal * 100.0 : na,
+     "Current extreme final (%)",
+     display=display.data_window)
+
+plot(float(nSwings),
+     "Independent historical swings",
+     display=display.data_window)
+
+plot(neff,
+     "Effective swing sample",
+     display=display.data_window)
+
+plot(modelBrier,
+     "Frozen-model Brier score",
+     display=display.data_window)
+
+plot(baselineBrier,
+     "Historical-base Brier score",
+     display=display.data_window)
+
+plot(float(validationN),
+     "Resolved validation forecasts",
+     display=display.data_window)
